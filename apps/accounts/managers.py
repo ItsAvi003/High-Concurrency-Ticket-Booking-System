@@ -33,6 +33,8 @@ class UserManager(BaseUserManager):
     def create_superuser(self, email, password=None, **extra_fields):
         extra_fields.setdefault("is_staff", True)
         extra_fields.setdefault("is_superuser", True)
+        # A superuser should also be an admin in the API, not just on the /admin/ site.
+        extra_fields.setdefault("role", self.model.Role.ADMIN)
         if extra_fields["is_staff"] is not True or extra_fields["is_superuser"] is not True:
             raise ValueError("Superuser must have is_staff=True and is_superuser=True")
         return self._create_user(email, password, **extra_fields)

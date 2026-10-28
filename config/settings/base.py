@@ -6,6 +6,7 @@ environment variables, never hard-coded. dev.py / prod.py / test.py import this
 module and override only what they need.
 """
 
+from datetime import timedelta
 from pathlib import Path
 
 import environ
@@ -31,6 +32,9 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    # Third party
+    "rest_framework",
+    "rest_framework_simplejwt.token_blacklist",
     # Local apps
     "apps.core",
     "apps.accounts",
@@ -98,6 +102,37 @@ AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
     {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
 ]
+
+# --- Django REST Framework ------------------------------------------------------
+REST_FRAMEWORK = {
+    # Stateless bearer tokens only. No SessionAuthentication, so the API never relies on
+    # cookies and therefore needs no CSRF protection.
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework_simplejwt.authentication.JWTAuthentication",
+    ],
+    # Secure by default: a view that forgets to declare permissions is locked, not open.
+    "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.IsAuthenticated"],
+    "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
+    "DEFAULT_PARSER_CLASSES": ["rest_framework.parsers.JSONParser"],
+    # Never return unbounded lists. Phase 7 switches large lists to cursor pagination.
+    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+    "PAGE_SIZE": 20,
+    "TEST_REQUEST_DEFAULT_FORMAT": "json",
+}
+
+# --- JWT (SimpleJWT) ------------------------------------------------------------
+SIMPLE_JWT = {
+    # Short-lived: a stolen access token is only useful for minutes.
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=env.int("JWT_ACCESS_TOKEN_MINUTES", default=15)),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=env.int("JWT_REFRESH_TOKEN_DAYS", default=7)),
+    # Every refresh returns a new refresh token and blacklists the old one, so a leaked
+    # refresh token stops working as soon as the real client uses it once.
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
+    "UPDATE_LAST_LOGIN": True,
+    "AUTH_HEADER_TYPES": ("Bearer",),
+    # SIGNING_KEY defaults to SECRET_KEY: rotating SECRET_KEY logs everyone out.
+}
 
 # --- I18N / time --------------------------------------------------------------
 LANGUAGE_CODE = "en-us"

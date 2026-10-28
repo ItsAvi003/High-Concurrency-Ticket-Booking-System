@@ -8,11 +8,13 @@ from apps.accounts.models import User
 class UserAdmin(DjangoUserAdmin):
     # The stock UserAdmin references `username` everywhere; replace those with `email`.
     ordering = ("email",)
-    list_display = ("email", "first_name", "last_name", "is_staff", "is_active")
+    list_display = ("email", "first_name", "last_name", "role", "is_staff", "is_active")
+    list_filter = ("role", "is_staff", "is_superuser", "is_active")
     search_fields = ("email", "first_name", "last_name")
     fieldsets = (
         (None, {"fields": ("email", "password")}),
         ("Personal info", {"fields": ("first_name", "last_name")}),
+        ("Role", {"fields": ("role",)}),
         (
             "Permissions",
             {"fields": ("is_active", "is_staff", "is_superuser", "groups", "user_permissions")},
