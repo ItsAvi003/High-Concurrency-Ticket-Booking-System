@@ -1,0 +1,5 @@
+-r base.txt
+
+pytest>=8.3,<9
+pytest-django>=4.9,<5
+ruff>=0.8

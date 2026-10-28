@@ -1,0 +1,24 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Django
+staticfiles/
+media/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
