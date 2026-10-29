@@ -157,3 +157,88 @@ Condensed revision notes, one section per phase.
    `role`, so the input is ignored and the model default (`user`) applies. Roles only change via
    `PATCH /users/<id>/role/`, guarded by `IsAdminRole`. There's a test that posts `role=admin,
    is_staff=true` and asserts a plain user is created.
+
+---
+
+## Phase 2: Core domain models and read APIs
+
+### What exists
+- `Venue` (layout only: rows x seats_per_row), `Event` (organizer, venue, times, price,
+  status), `Seat` (per-event inventory row), `Booking` (user, seat, status, amount).
+- Creating an event generates its seats in the same transaction (`services.create_event_with_seats`,
+  `bulk_create` in batches of 1000). 1000 seats ~120 ms.
+- Public API: `/events/`, `/events/<id>/`, `/events/<id>/seats/` (AllowAny, read-only, only
+  published + upcoming). Organizer API: `/organizer/events/` (ModelViewSet, scoped to own events).
+  Venues: read public, write admin.
+- `Conflict` (409) exception, and an exception handler mapping `ProtectedError` -> 409.
+
+### Concepts
+- **DB constraints vs serializer validation**: serializers give friendly 400s; constraints
+  (`CheckConstraint`, `UniqueConstraint`) make Postgres reject bad data from *any* code path.
+  Do both: the serializer for UX, the DB for truth.
+- **Partial unique index**: `UniqueConstraint(fields=["seat"], condition=Q(status__in=[...]))`
+  -> `CREATE UNIQUE INDEX ... WHERE status IN ('pending','confirmed')`. Uniqueness only among
+  active bookings, so a seat can be re-booked after a cancellation.
+- **on_delete**: CASCADE (seats die with their event), PROTECT (bookings, events' organizer/
+  venue: refuse the delete, raising `ProtectedError`). The chain Event -CASCADE-> Seat
+  <-PROTECT- Booking means an event with bookings can't be deleted at all.
+- **Decimal for money**: floats can't represent 0.1 exactly. DRF serializes Decimal as a string
+  ("499.00") so JSON clients don't turn it into a float.
+- **N+1 queries**: a list of N events that touches `event.venue` lazily runs 1 + N queries.
+  `select_related` (SQL JOIN, for FK/one-to-one) fixes it; `prefetch_related` (a second query
+  + Python join) is for reverse FK / M2M. Aggregates via `annotate(Count(...))` run inside one
+  GROUP BY query.
+- **Custom QuerySet** (`EventQuerySet.publicly_visible()`, `.with_seat_counts()`): named,
+  chainable, reusable query logic instead of repeating filters in views.
+- **ViewSet + Router**: one class gives list/create/retrieve/update/destroy; the router builds
+  the URLs. `@action(detail=True)` adds custom routes like `/events/<id>/seats/`.
+- **Queryset scoping for ownership**: filter `get_queryset()` by owner, so others' objects are
+  404 (no existence leak) and can't be edited or deleted.
+- **Service layer**: multi-model writes (event + seats, price propagation) in `services.py`
+  under `@transaction.atomic`, so views stay thin and the logic is testable without HTTP.
+- **State machine**: `ALLOWED_TRANSITIONS` dict + `can_transition_to()`.
+
+### Decisions and tradeoffs
+- Seats are per-event rows generated from the venue layout. They're the lock target in
+  Phase 3. Cost: 1000 rows per 1000-seat event (fine; Postgres handles millions).
+- Venue is immutable on an event (seats came from its layout). Price changes reprice only
+  *available* seats; `Booking.amount` keeps what was actually charged.
+- Only drafts are deletable; published events get cancelled (audit trail, bookings intact).
+- Events are always created as drafts; publishing requires a future start.
+- Organizer ownership via queryset scoping (404). Admins see all (`IsOrganizer` admits admins).
+- Seat status lives on `Seat` (fast filtering and the Phase 3 lock target), *and* the partial
+  unique index on Booking is the final guarantee. Phase 3 updates both in one transaction.
+- Seat map uses bigger pages (200, max 1000) than event lists (20).
+- `row_number` stored as an int, `row_label` ("A".."AA") computed, so ordering is correct.
+- Performance indexes (e.g. `Event(status, starts_at)`) deliberately left for Phase 7's
+  EXPLAIN ANALYZE before/after.
+
+### Shortcuts (and the real-world version)
+- One booking = one seat. Real: an Order with many Tickets, paid together.
+- Rectangular venue layout and a single price per event. Real: sections, price tiers, an
+  accessible-seating flag, a seat map designer.
+- Single currency (INR), implied. Real: a currency field and amounts in minor units (paise).
+- Sequential integer IDs are public (they leak counts like "event #1"). Real: UUIDs or slugs.
+- Public list counts seats with COUNT over a join. At large scale: a denormalized
+  `available_seats` counter or a cache (Phase 7).
+- Cancelling an event doesn't yet cancel or refund its bookings (needs Phase 5/6).
+
+### Interview Q&A
+1. **How do you guarantee a seat is never sold twice, even with a bug in your code?** A partial
+   unique index: one row per seat where status is pending or confirmed. Postgres rejects the
+   second INSERT with IntegrityError no matter which code path runs. Phase 3's locking keeps it
+   from ever being hit in normal operation, but it's the last line of defence.
+2. **Why per-event Seat rows instead of seats on the venue?** Inventory is per event: seat A1 can
+   be booked for Friday's show and free on Saturday. Per-event rows give one row to lock and
+   update per (event, seat), which is exactly what Phase 3's `select_for_update` needs.
+3. **What's an N+1 and how did you avoid it?** Listing N events and reading `event.venue` in the
+   serializer fires one venue query per event. I `select_related("venue")` and annotate seat
+   counts with `Count(..., filter=Q(...))`, so the list is exactly 2 queries (COUNT + page) for
+   any page size. A test with `django_assert_num_queries(2)` enforces it; removing
+   `select_related` makes it fail with 10 queries.
+4. **Why 404 instead of 403 for another organizer's event?** 403 confirms the ID exists. Scoping
+   `get_queryset()` to the owner makes other events invisible, and it also blocks update and
+   delete, because those go through the same `get_object()`.
+5. **CASCADE vs PROTECT, where and why?** Seats CASCADE from events (meaningless alone). Bookings
+   PROTECT seats and users: they're financial records. Because of that, deleting an event with
+   bookings raises ProtectedError, which my exception handler turns into 409 instead of a 500.

@@ -33,12 +33,26 @@ Send the access token as `Authorization: Bearer <token>`.
 | GET    | `/api/v1/auth/me/`            | Current user (any role)             |
 | GET    | `/api/v1/users/`              | List users (admin role)             |
 | PATCH  | `/api/v1/users/<id>/role/`    | Change a user's role (admin role)   |
+| GET    | `/api/v1/venues/`             | List venues (public); POST/PATCH/DELETE admin role |
+| GET    | `/api/v1/events/`             | Published upcoming events (public). Filters: `city`, `starts_after`, `starts_before` |
+| GET    | `/api/v1/events/<id>/`        | Event detail (public)               |
+| GET    | `/api/v1/events/<id>/seats/`  | Seat map (public). Filter: `status`; `page_size` up to 1000 |
+| CRUD   | `/api/v1/organizer/events/`   | Organizer's own events (admin sees all). Only drafts can be deleted |
+
+## Data model
+
+```
+Venue (rows x seats_per_row)
+  └── Event (organizer, status: draft -> published -> cancelled)
+        └── Seat (row_number, number, price, status)   one row per seat per event
+              └── Booking (user, status, amount)        at most one active booking per seat
+```
 
 ## Progress
 
 - [x] Phase 0: Project foundation
 - [x] Phase 1: Auth and roles
-- [ ] Phase 2: Core domain models and read APIs
+- [x] Phase 2: Core domain models and read APIs
 - [ ] Phase 3: Concurrency-safe booking
 - [ ] Phase 4: Seat hold with expiry
 - [ ] Phase 5: Idempotent payment flow (Razorpay)
