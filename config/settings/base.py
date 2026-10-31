@@ -123,6 +123,12 @@ REST_FRAMEWORK = {
     "EXCEPTION_HANDLER": "apps.core.exceptions.api_exception_handler",
 }
 
+# --- Booking ----------------------------------------------------------------------
+# How POST /bookings/ protects a seat from concurrent buyers: "pessimistic" (row lock,
+# SELECT ... FOR UPDATE) or "optimistic" (version check, retry). See apps/bookings/services.py.
+BOOKING_LOCK_STRATEGY = env.str("BOOKING_LOCK_STRATEGY", default="pessimistic")
+BOOKING_OPTIMISTIC_MAX_ATTEMPTS = 3
+
 # --- JWT (SimpleJWT) ------------------------------------------------------------
 SIMPLE_JWT = {
     # Short-lived: a stolen access token is only useful for minutes.

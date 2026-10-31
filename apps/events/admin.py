@@ -22,8 +22,10 @@ class EventAdmin(admin.ModelAdmin):
 
 @admin.register(Seat)
 class SeatAdmin(admin.ModelAdmin):
-    list_display = ("event", "row_label", "number", "price", "status")
+    list_display = ("event", "row_label", "number", "price", "status", "version")
     list_filter = ("status",)
     search_fields = ("event__title",)
     list_select_related = ("event",)
     raw_id_fields = ("event",)
+    # Editing a seat in the admin wouldn't bump version, so don't allow editing it by hand.
+    readonly_fields = ("version",)

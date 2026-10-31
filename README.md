@@ -38,6 +38,41 @@ Send the access token as `Authorization: Bearer <token>`.
 | GET    | `/api/v1/events/<id>/`        | Event detail (public)               |
 | GET    | `/api/v1/events/<id>/seats/`  | Seat map (public). Filter: `status`; `page_size` up to 1000 |
 | CRUD   | `/api/v1/organizer/events/`   | Organizer's own events (admin sees all). Only drafts can be deleted |
+| POST   | `/api/v1/bookings/`           | `{"seat": id}` -> 201, 409 if taken, 400 if event not bookable |
+| GET    | `/api/v1/bookings/`           | Your bookings (admin: all)          |
+| POST   | `/api/v1/bookings/<id>/cancel/` | Cancel a pending booking, freeing the seat (idempotent) |
+
+## Concurrency: selling the last seat exactly once
+
+Two strategies in [apps/bookings/services.py](apps/bookings/services.py), chosen by
+`BOOKING_LOCK_STRATEGY`:
+
+- **pessimistic** (default): `SELECT ... FOR UPDATE OF "events_seat"`, then check and write.
+- **optimistic**: read `version`, then `UPDATE ... WHERE version = <read>`; on 0 rows re-read
+  (up to 3 attempts).
+
+Underneath both, a partial unique index (`seat_id WHERE status IN ('pending','confirmed')`)
+makes a double booking impossible even if the application logic were wrong.
+
+Proof: `test_100_parallel_requests_for_10_seats_sell_exactly_10` fires 100 parallel HTTP
+requests (100 threads, 100 DB connections) at 10 seats: exactly 10 x 201 and 90 x 409, for both
+strategies. A deliberately naive check-then-act version in the same file lets 19 of 20
+requests pass the availability check for a single seat; only the DB index stops it.
+
+`python manage.py compare_locking --requests 100 --rounds 5` (median of 5, local Docker):
+
+| scenario      | strategy    | booked | 409s | retries | wall ms | p50 ms | p95 ms |
+|---------------|-------------|-------:|-----:|--------:|--------:|-------:|-------:|
+| hot seat      | pessimistic |      1 |   99 |       0 |     485 |    394 |    436 |
+| hot seat      | optimistic  |      1 |   99 |      99 |     731 |    526 |    637 |
+| 10 seats      | pessimistic |     10 |   90 |       0 |     516 |    406 |    472 |
+| 10 seats      | optimistic  |     10 |   90 |      90 |     753 |    567 |    675 |
+| no contention | pessimistic |    100 |    0 |       0 |     765 |    663 |    721 |
+| no contention | optimistic  |    100 |    0 |       0 |     793 |    654 |    740 |
+
+Pessimistic wins under contention here: an optimistic loser's UPDATE still waits for the
+winner's row lock, then needs a second read to learn the seat is gone. Latencies include
+100 Python threads opening fresh connections at once, so compare rows, not absolutes.
 
 ## Data model
 
@@ -53,7 +88,7 @@ Venue (rows x seats_per_row)
 - [x] Phase 0: Project foundation
 - [x] Phase 1: Auth and roles
 - [x] Phase 2: Core domain models and read APIs
-- [ ] Phase 3: Concurrency-safe booking
+- [x] Phase 3: Concurrency-safe booking
 - [ ] Phase 4: Seat hold with expiry
 - [ ] Phase 5: Idempotent payment flow (Razorpay)
 - [ ] Phase 6: Async work and reliability

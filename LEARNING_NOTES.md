@@ -242,3 +242,97 @@ Condensed revision notes, one section per phase.
 5. **CASCADE vs PROTECT, where and why?** Seats CASCADE from events (meaningless alone). Bookings
    PROTECT seats and users: they're financial records. Because of that, deleting an event with
    bookings raises ProtectedError, which my exception handler turns into 409 instead of a 500.
+
+---
+
+## Phase 3: Concurrency-safe booking
+
+### What exists
+- `POST /bookings/ {"seat": id}`, `GET /bookings/`, `GET /bookings/<id>/`,
+  `POST /bookings/<id>/cancel/`. Bookings are created `pending`; the seat becomes `booked`.
+- `apps/bookings/services.py`: `book_seat_pessimistic`, `book_seat_optimistic`, `cancel_booking`;
+  `book_seat` dispatches on `settings.BOOKING_LOCK_STRATEGY`.
+- `Seat.version` (optimistic counter). Every seat write bumps it, including repricing.
+- Tests: 100 parallel HTTP requests vs 10 seats (both strategies), a naive race demo, 50-vs-1
+  hot seat, deterministic retry tests, and isolation-level demos (RC vs RR).
+- `manage.py compare_locking`: a benchmark table. Postgres `max_connections=200` in compose.
+
+### Concepts
+- **Race condition / check-then-act**: two transactions both read "available" before either
+  writes. Naive demo: 19 of 20 parallel requests passed the check for one seat.
+- **Pessimistic locking**: `select_for_update()` -> `SELECT ... FOR UPDATE`. Holds a row lock
+  until COMMIT/ROLLBACK; others wanting the same lock wait in a queue. Must run inside
+  `transaction.atomic()` (Django raises an error otherwise).
+- **`of=("self",)`**: with `select_related`, plain FOR UPDATE also locks the joined rows (the
+  event!), which would serialize all bookings for an event. `FOR UPDATE OF "events_seat"` locks
+  only the seat. A test asserts the exact SQL.
+- **Optimistic locking**: a version column + conditional UPDATE (compare-and-swap):
+  `UPDATE ... SET version=version+1 WHERE id=? AND version=?`. Rowcount 0 = conflict -> re-read.
+  Every writer must bump version, or conflicts go undetected.
+- **Isolation levels** (Postgres): READ COMMITTED (default; each *statement* sees data
+  committed before it started), REPEATABLE READ (one snapshot per transaction; a concurrent
+  update of a row you then write -> serialization failure), SERIALIZABLE (as if transactions ran
+  one at a time; may abort with serialization failures, so the app must retry). READ UNCOMMITTED
+  behaves like READ COMMITTED in Postgres: dirty reads never happen.
+- **Anomalies still possible at READ COMMITTED**: non-repeatable reads, phantom reads, lost
+  updates (read-modify-write races), write skew. Demonstrated: a lost update at RC; the same
+  interleaving aborts at RR; a conditional UPDATE at RC is safe.
+- **Postgres UPDATE at RC**: if the row is being updated by another transaction, the UPDATE waits,
+  then re-evaluates its WHERE on the newly committed version (that's why the
+  compare-and-swap works without explicit locks).
+- **Deadlock**: T1 holds A and wants B, T2 holds B and wants A. Prevent it by taking locks in
+  one global order (we always lock the seat before the booking). Postgres detects deadlocks and
+  aborts one transaction after `deadlock_timeout` (1s).
+- **Savepoint**: `atomic()` nested inside `atomic()`; an IntegrityError rolls back only the
+  savepoint, so we can turn it into a clean 409.
+- **transaction=True tests**: normal tests run inside one uncommitted transaction that other
+  connections can't see; threaded tests need real commits (the tables are truncated afterwards).
+- **Connections**: one per thread. 100 threads = 100 Postgres connections (each a server process,
+  ~5-10 MB). Production uses a pooler (PgBouncer) rather than raising max_connections.
+
+### Decisions and tradeoffs
+- Pessimistic is the default: under contention it was faster in the benchmark (fewer round
+  trips, no retries), simpler, and hot seats (front row, last seat) are the norm for ticketing.
+- Optimistic loses under contention in Postgres because a loser's UPDATE still waits for the
+  winner's row lock, then must re-read. It shines when the gap between read and write is long
+  (user think time, across HTTP requests via ETag/If-Match, across services), where holding a
+  DB lock is impossible.
+- Both strategies end in the same partial unique index (defence in depth). The index hit is
+  logged at ERROR, because reaching it means a bug.
+- `BookingCreateSerializer` uses IntegerField, not PrimaryKeyRelatedField (which would do an
+  unlocked SELECT before the locked one).
+- Cancel locks seat -> booking (the same order as booking: seat -> new booking) to avoid deadlocks.
+  Cancel is idempotent.
+- Only pending bookings are cancellable until refunds exist (Phase 5).
+
+### Shortcuts (and the real-world version)
+- No idempotency key on POST /bookings/, so a double-click could book two different seats
+  (each for the same user). Phase 5 adds idempotency keys.
+- No per-user limit (one user could book every seat). Real: max tickets per user per event,
+  plus rate limiting (Phase 6).
+- `max_connections=200` instead of PgBouncer. Real: transaction-mode PgBouncer in front of Postgres.
+- The benchmark runs in one Python process (GIL, fresh connections), so absolutes are inflated;
+  the comparison between rows is what's meaningful.
+- Pending bookings never expire yet; Phase 4 adds 10-minute holds with expiry.
+
+### Interview Q&A
+1. **Pessimistic vs optimistic: when would you use each?** Pessimistic (`SELECT FOR UPDATE`) when
+   conflicts are likely and the critical section is short: hot seats. Optimistic (version check +
+   retry) when conflicts are rare or the read-to-write gap is long (a user editing a form), where
+   holding a lock is impossible. My benchmark: 100 requests at 1 seat, pessimistic p50 394 ms vs
+   optimistic 526 ms with 99 retries; with no contention they're about equal.
+2. **What isolation level does Postgres use by default, and what can still go wrong?** READ
+   COMMITTED. No dirty reads, but non-repeatable reads, phantoms, lost updates and write skew
+   are possible. My test shows two transactions both reading "available" and both UPDATEs
+   succeeding at RC. Under REPEATABLE READ the second one gets a serialization failure.
+3. **Why not just use SERIALIZABLE everywhere?** It's correct but pushes the cost onto the app:
+   any transaction may abort with a serialization failure and must be retried, and aborts get
+   frequent under contention. Targeted row locks or conditional updates at READ COMMITTED are
+   cheaper and more predictable for a known hot spot.
+4. **How do you prove your booking is safe?** A test with 100 threads, each its own DB connection,
+   released by a barrier, sending real HTTP requests for 10 seats: exactly 10 x 201, 90 x 409, no
+   errors, 10 bookings, all seats booked, for both strategies, stable over repeated runs. Plus a
+   naive version that lets 19 of 20 requests through the check, to show the test can catch the bug.
+5. **What happens if the app crashes after locking the seat?** The lock lives inside the
+   transaction. If the process dies or the connection drops, Postgres rolls back and releases
+   it. No seat is left half-booked: the seat UPDATE and booking INSERT commit together or not at all.

@@ -143,6 +143,9 @@ class Seat(models.Model):
     number = models.PositiveSmallIntegerField()
     price = models.DecimalField(max_digits=10, decimal_places=2)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.AVAILABLE)
+    # Optimistic-locking counter. EVERY write to a seat must increment it (use
+    # F("version") + 1), otherwise a concurrent optimistic writer can't detect the change.
+    version = models.PositiveIntegerField(default=0)
 
     class Meta:
         constraints = [

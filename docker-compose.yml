@@ -3,6 +3,9 @@ name: booking
 services:
   db:
     image: postgres:17-alpine
+    # Default is 100. The concurrency test opens 100 connections at once (one per thread)
+    # plus the test runner's own. Production would put PgBouncer in front instead.
+    command: ["postgres", "-c", "max_connections=200"]
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}

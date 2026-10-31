@@ -4,6 +4,7 @@ several models themselves, so multi-step changes live in one transactional place
 """
 
 from django.db import transaction
+from django.db.models import F
 
 from apps.events.models import Event, Seat
 
@@ -41,5 +42,8 @@ def update_event(event: Event, **changes) -> Event:
         setattr(event, field, value)
     event.save()
     if price_changed:
-        event.seats.filter(status=Seat.Status.AVAILABLE).update(price=event.price)
+        # Bump version so an optimistic booking that read the old price fails and re-reads.
+        event.seats.filter(status=Seat.Status.AVAILABLE).update(
+            price=event.price, version=F("version") + 1
+        )
     return event
